@@ -8,7 +8,7 @@
  * 빠진 표본이 있으면 그 위치와 길이를 알려 줍니다. 처음이라면 Ex.10 을 먼저 해 보세요.
  *
  * [저장하는 값]
- *   h10_loop_count    H10 이 세는 루프 카운터 (디코더가 시간축으로 씁니다)
+ *   h10_loop_count    H10 루프 카운터 — 보조가 시작될 때 CM 이 0 으로 돌립니다. CM 로그의 seq 와 같은 값입니다 (디코더가 시간축으로 씁니다)
  *   hip_angle         고관절 각도, 왼쪽 · 오른쪽 [deg]
  *   thigh_angle       허벅지 각도, 왼쪽 · 오른쪽 [deg]
  *   knee_angle        무릎 각도(추정), 왼쪽 · 오른쪽 [deg]
@@ -20,7 +20,7 @@
  *   fsm_state         H10 의 FSM 상태
  *   h10_connected     H10 연결 여부
  *   sync_level        D8 입력 레벨 (외부 장비 trigger, 0/1)
- *   sync_active       부팅 직후 레벨과 다르면 1 (외부 장비 녹화 중)
+ *   sync_save_active  부팅 직후 레벨과 다르면 1 (외부 장비 녹화 중)
  *   sync_edge_count   D8 레벨 변화 누적 횟수
  *
  * [시간축]
@@ -40,6 +40,7 @@
  *   1. FAT32 로 포맷한(할당 단위 32 KB 권장) USB 메모리를 꽂습니다. LED 1 이 켜지면 저장할 수 있습니다.
  *      H10 을 연결하고 착용자가 입은 뒤에 시작하세요(H10 이 없으면 H10 값은 0 으로 저장됩니다).
  *   2. 버튼 1 을 짧게 누르면 저장을 시작합니다. LED 2 가 천천히 깜빡이는 동안 저장 중입니다.
+ *      AUTO_LOG_ON_H10_ASSIST 가 1 이면 H10 이 보조 모드로 바뀔 때 저장이 자동으로 시작되고, 보조가 끝나면 멈춥니다(USB 메모리가 준비되었을 때만).
  *   3. 버튼 2 · 3 으로 원하는 순간에 표시(마커)를 넣습니다.
  *   4. 버튼 1 을 다시 누르면 멈춥니다. LED 2 가 빠르게 깜빡이는 동안은 파일을 닫는 중이니 기다리세요.
  *      LED 2 가 켜진 채로 있으면 저장이 끝난 것입니다. 이제 USB 메모리를 뽑아도 됩니다.
@@ -114,6 +115,16 @@
  */
 #define USE_H10_ASSIST          (1)
 
+/*
+ * H10 보조 모드에 맞춰 자동 저장 — 0: 끔(버튼 1 로만) · 1: 켬
+ * 1 이면 H10 이 대기(Standby) → 보조(Assist)로 바뀌는 순간 저장을 시작하고, 보조가 끝나면(대기로 바뀌거나 H10 연결이 끊기면) 멈춥니다.
+ * USB 메모리가 준비되어 있을 때(LED 1 켜짐)만 시작합니다. 준비되지 않았으면 아무것도 하지 않습니다(오류로 보지 않음).
+ * 이미 보조 중일 때 USB 메모리를 꽂으면 시작하지 않습니다. 그때는 버튼 1 로 시작하세요.
+ * 자동으로 멈추는 것은 자동으로 시작한 저장뿐입니다. 버튼 1 로 시작한 저장은 버튼 1 로 멈춥니다.
+ */
+#define AUTO_LOG_ON_H10_ASSIST  (1)
+#define H10_MODE_STABLE_MS      (0U)      /* 보조 / 대기가 이만큼 이어져야 바뀐 것으로 봅니다 (순간적인 값 튐 무시) */
+
 /* 마커 종류 (1 ~ 254, 뜻은 사용자가 정합니다) */
 #define MARKER_WALK_START       (1U)        /* 버튼 2 — 걷기 시작 */
 #define MARKER_EVENT            (2U)        /* 버튼 3 — 이벤트 */
@@ -129,11 +140,10 @@
 /*
  * 외부 장비 sync 입력 — 헤더 왼쪽에서 9 번째 핀(EXT_GPIO_8)을 신호로, 맨 오른쪽 핀(GND)을 외부 장비 GND 에 연결합니다.
  * GND 는 두 장비의 기준 전압을 맞추는 선이라 코드로 읽지 않습니다. 연결하지 않으면 레벨이 흔들립니다.
- * 부팅 직후 핀은 풀업 · 풀다운 없는 입력이라, Control_Setup() 에서 풀다운 입력으로 설정합니다(선이 빠져도 0 으로 읽힘).
- * 외부 장비가 오픈 컬렉터(평상시 열림, active-low) 출력이면 XM_EXT_DIO_MODE_INPUT_PULLUP 으로 바꾸세요.
+ * 시스템이 Control_Setup() 전에 풀다운 입력으로 설정합니다. 핀 모드를 바꾸지 마세요
+ * (바꾸면 시스템이 Total Data 로 보내는 sync 값 — sync_save_active 등 — 이 의미 없어집니다).
  */
 #define SYNC_DIN_PIN            (XM_EXT_DIO_8)
-#define SYNC_DIN_MODE           (XM_EXT_DIO_MODE_INPUT_PULLDOWN)
 
 /**
  *-----------------------------------------------------------
@@ -150,7 +160,7 @@
  * - 첫 필드 h10_loop_count 의 이름을 바꾸지 마세요. 디코더가 이 이름의 열을 시간축으로 씁니다.
  */
 typedef struct __attribute__((packed)) {
-    uint32_t h10_loop_count;    /**< H10 루프 카운터 (XM.status.h10.h10AssistModeLoopCnt) */
+    uint32_t h10_loop_count;    /**< H10 루프 카운터 (XM.status.h10.h10AssistModeLoopCnt, CM 로그의 seq) */
 
     /* --- 각도 [deg] --- */
     float    hip_angle_L;       /**< 왼쪽 고관절 */
@@ -188,7 +198,7 @@ typedef struct __attribute__((packed)) {
 
     /* --- 외부 장비 sync (D8) --- */
     uint8_t  sync_level;        /**< D8 입력 레벨 (0/1) */
-    uint8_t  sync_active;       /**< 부팅 직후 레벨과 다르면 1 */
+    uint8_t  sync_save_active;  /**< 부팅 직후 레벨과 다르면 1 (외부 장비 녹화 중) */
     uint16_t sync_edge_count;   /**< D8 레벨 변화 누적 횟수 */
 } GaitLogRecord_t;
 
@@ -208,7 +218,8 @@ _Static_assert(sizeof(GaitLogRecord_t) == 100U, "GaitLogRecord_t 크기가 바�
     "imu_gyr_L_x(float), imu_gyr_L_y(float), imu_gyr_L_z(float), " \
     "imu_gyr_R_x(float), imu_gyr_R_y(float), imu_gyr_R_z(float), " \
     "foot_contact_L(uint8_t), foot_contact_R(uint8_t), " \
-    "fsm_state(uint8_t), h10_connected(uint8_t), "     "sync_level(uint8_t), sync_active(uint8_t), sync_edge_count(uint16_t)"
+    "fsm_state(uint8_t), h10_connected(uint8_t), " \
+    "sync_level(uint8_t), sync_save_active(uint8_t), sync_edge_count(uint16_t)"
 
 /**
  *-----------------------------------------------------------
@@ -218,6 +229,9 @@ _Static_assert(sizeof(GaitLogRecord_t) == 100U, "GaitLogRecord_t 크기가 바�
 
 /* 마지막 시작의 결과 (0 = 시작함, 그 밖에는 시작하지 못한 이유 — XmUsbLogStartError_e). LED 3 이 켜지면 이 값을 보세요 */
 volatile XmUsbLogStartError_e g_last_start_error = XM_USB_LOG_START_OK;
+
+/* sync 핀(D8) 레벨 (0/1) — 1 ms 마다 읽은 값. 저장하지 않을 때도 갱신됩니다 */
+volatile uint8_t g_sync_level;
 
 /**
  *------------------------------------------------------------
@@ -242,6 +256,12 @@ static uint8_t       s_sync_idle;        /* 부팅 직후 D8 레벨 (평상시) 
 static uint8_t       s_sync_prev;        /* 직전 루프의 D8 레벨 */
 static uint16_t      s_sync_edges;       /* D8 레벨 변화 누적 횟수 */
 
+static bool          s_h10_assist;       /* H10 이 보조 중인가 (H10_MODE_STABLE_MS 동안 이어진 값) */
+static uint16_t      s_h10_assist_ms;    /* s_h10_assist 와 다른 값이 이어진 시간 [ms] */
+static bool          s_h10_assist_began; /* 이번 루프에 보조가 시작되었다 */
+static bool          s_h10_assist_ended; /* 이번 루프에 보조가 끝났다 */
+static bool          s_auto_started;     /* 지금 저장은 H10 보조 시작으로 자동 시작했다 */
+
 /**
  *------------------------------------------------------------
  * STATIC (PRIVATE) FUNCTION PROTOTYPES
@@ -258,6 +278,7 @@ static void Closing_Entry(void);
 static void Closing_Loop(void);
 
 static void _UpdateLogData(void);
+static void _UpdateH10Assist(void);
 static void _ShowStickLed(void);
 static void _TryStart(void);
 static void _ShowStartError(XmUsbLogStartError_e reason);
@@ -314,11 +335,8 @@ void Control_Setup(void)
         s_error = true;         /* 등록하지 못했습니다. LED 3 이 켜집니다 */
     }
 
-    /* 3. 외부 장비 sync 입력(D8) — 핀 모드는 여기서 한 번만 정합니다 (1 ms 루프 안에서 부르지 마세요) */
-    XM_SetPinMode(SYNC_DIN_PIN, SYNC_DIN_MODE);
-
 #if (USE_H10_ASSIST == 1)
-    /* 4. [선택] H10 의 기존 보조 알고리즘을 켭니다. 착용자에게 보조 토크가 걸립니다(USE_H10_ASSIST 설명 참고) */
+    /* 3. [선택] H10 의 기존 보조 알고리즘을 켭니다. 착용자에게 보조 토크가 걸립니다(USE_H10_ASSIST 설명 참고) */
     XM_SetH10AssistExistingMode(true);
 #endif
 }
@@ -331,7 +349,10 @@ void Control_Loop(void)
     /* 1. 저장할 값을 채웁니다. 저장은 Control_Loop() 가 끝난 뒤 시스템이 합니다. */
     _UpdateLogData();
 
-    /* 2. 버튼 · LED · 시작 · 정지 */
+    /* 2. H10 보조 시작 · 끝을 알아봅니다 (AUTO_LOG_ON_H10_ASSIST) */
+    _UpdateH10Assist();
+
+    /* 3. 버튼 · LED · 시작 · 정지 */
     XM_TSM_Run(s_tsm);
 }
 
@@ -368,6 +389,12 @@ static void Standby_Loop(void)
 
     if (XM_GetButtonEvent(XM_BTN_1) == XM_BTN_CLICK) {
         _TryStart();
+        s_auto_started = false;
+    } else if (AUTO_LOG_ON_H10_ASSIST && s_h10_assist_began
+               && XM_IsUsbLogReady() && XM_IsUsbLogSessionIdle()) {
+        /* H10 보조가 시작되었고 USB 메모리가 준비되었습니다. 준비되지 않았으면 아무것도 하지 않습니다 */
+        _TryStart();
+        s_auto_started = true;
     }
 }
 
@@ -417,8 +444,10 @@ static void Active_Loop(void)
     _HandleMarkerButton(XM_BTN_2, MARKER_WALK_START);
     _HandleMarkerButton(XM_BTN_3, MARKER_EVENT);
 
-    /* 버튼 1: 정지 */
+    /* 버튼 1: 정지. 자동으로 시작한 저장은 H10 보조가 끝나도 멈춥니다 */
     if (XM_GetButtonEvent(XM_BTN_1) == XM_BTN_CLICK) {
+        XM_TSM_TransitionTo(s_tsm, STATE_CLOSING);
+    } else if (s_auto_started && s_h10_assist_ended) {
         XM_TSM_TransitionTo(s_tsm, STATE_CLOSING);
     }
 }
@@ -507,6 +536,7 @@ static void _UpdateLogData(void)
 
     /* 외부 장비 sync — 부팅 후 첫 루프의 레벨을 평상시로 기억하고, 그와 다르면 active */
     uint8_t level = (XM_DigitalRead(SYNC_DIN_PIN) == XM_HIGH) ? 1U : 0U;
+    g_sync_level = level;
     if (!s_sync_init) {
         s_sync_init = true;
         s_sync_idle = level;
@@ -517,8 +547,32 @@ static void _UpdateLogData(void)
         s_sync_prev = level;
     }
     s_log.sync_level      = level;
-    s_log.sync_active     = (level != s_sync_idle) ? 1U : 0U;
+    s_log.sync_save_active = (level != s_sync_idle) ? 1U : 0U;
     s_log.sync_edge_count = s_sync_edges;
+}
+
+/*
+ * H10 보조 시작 · 끝을 알아봅니다. 보조 = H10 이 연결되어 있고 h10Mode 가 ASSIST.
+ * 새 값이 H10_MODE_STABLE_MS 동안 이어지면 바뀐 것으로 보고, 바뀐 그 루프에만 s_h10_assist_began / _ended 를 세웁니다.
+ */
+static void _UpdateH10Assist(void)
+{
+    const XmH10Data_t* h10 = &XM.status.h10;
+    bool assist = h10->is_connected && (h10->h10Mode == XM_H10_MODE_ASSIST);
+
+    s_h10_assist_began = false;
+    s_h10_assist_ended = false;
+
+    if (assist == s_h10_assist) {
+        s_h10_assist_ms = 0U;
+        return;
+    }
+    if (++s_h10_assist_ms >= H10_MODE_STABLE_MS) {
+        s_h10_assist       = assist;
+        s_h10_assist_ms    = 0U;
+        s_h10_assist_began = assist;
+        s_h10_assist_ended = !assist;
+    }
 }
 
 /* LED 1: USB 메모리가 준비되었는가 */
